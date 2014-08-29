@@ -1,4 +1,5 @@
 #include "list.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -13,26 +14,17 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <mqueue.h>
+#include <signal.h>
 
-#define CMD_HEARTBEAT   (1001)
-#define CMD_TUNNEL_RESP (1002)
+#include "interface.h"
 
-#define SERVER_LISTEN_PORT ("28099")
+#define SERVER_MAX_LISTEN 32
 
-#define SAFE_METHOD_FREE(method, p) do { if (NULL != p) { method(p); p = NULL;}} while (0)
-
-#define ASSERT_GOTO(cond, jump) {\
-    if (!(cond)) {\
-        printf("assert: %s failed[%m]!\n", #cond);\
-        goto jump;\
-    }\
-}
-#define ASSERT_RET(cond, ret) {\
-    if (!(cond)) {\
-        printf("assert: %s failed[%m]!\n", #cond);\
-        return (ret);\
-    }\
-}
+#define CMD_MQ_PATH         "/cmdMQ"
+#define MAX_CMD_MSG_NUMS    16
+#define MAX_CMD_MSG_LEN     4
+#define DEFAULT_MQ_MODE     0600
 
 #define CLIENT_HT_SIZE 40
 #define HASH(key)   (key%CLIENT_HT_SIZE)
@@ -40,7 +32,7 @@
 struct client_node_t {
     struct hlist_node       node;
     unsigned int            UnitNo;
-    unsigned char           UnitCode[16];
+    int                     ctl_fd;
     struct sockaddr_in      client;
 };
 
@@ -61,17 +53,25 @@ struct socket_pair {
     int s2;
 };
 
-static struct client_node_t *update_client_list(int UnitNo, 
-        const struct sockaddr *addr)
-{
-    char dst[INET_ADDRSTRLEN];
+struct msg_tunnel {
+    int             cmd;
+    unsigned int    UnitNo;
+    unsigned short  tunnelPort; 
+};
 
+static mqd_t cmd_mq;
+
+static struct client_node_t *update_client_list(int UnitNo, 
+        const struct sockaddr *addr, int fd)
+{
+    printf("in update_client_list!\n");
     struct client_node_t *t = NULL;
     struct client_node_t *find = NULL;
+    struct hlist_node *temp = NULL;
 
     struct hlist_head *hlisthead = &client_ht[HASH(UnitNo)].head;
 
-    hlist_for_each_entry(t, hlisthead, node) {
+    hlist_for_each_entry_safe(t, temp,  hlisthead, node) {
         if (t->UnitNo == UnitNo) {
             find = t;
             break;
@@ -88,8 +88,9 @@ static struct client_node_t *update_client_list(int UnitNo,
         if (NULL == t) {
             return NULL;
         }
-        t->client = *addr;
+        memcpy(&t->client, addr, sizeof(t->client));
         t->UnitNo = UnitNo;
+        t->ctl_fd = fd;
         INIT_HLIST_NODE(&t->node);
         hlist_add_head(&t->node, hlisthead);
     }
@@ -97,7 +98,7 @@ static struct client_node_t *update_client_list(int UnitNo,
     return t;
 }
 
-static int create_listener(const char *addr, const char *port)
+static int create_listener(const char *addr, const char *port, int listen_cnt)
 {
     int sd;
     struct addrinfo hints;
@@ -142,8 +143,7 @@ static int create_listener(const char *addr, const char *port)
     }
     freeaddrinfo(result);
 
-#define SERVER_MAX_LISTEN  32
-    if (listen(sd, SERVER_MAX_LISTEN) != 0)
+    if (listen(sd, listen_cnt) != 0)
     {
         printf("listen error[%m]\n");
         return -1;
@@ -254,24 +254,176 @@ static void daemon_init() {
     return;
 }
 
-int main(int argc, const char **argv) 
+int tunnel_thread(int fd)
 {
-    int ret, len, s1, s2, c, c1, c2, epoll_fd;
-    struct sockaddr_in server;
-    struct socket_pair *sp;
-    pthread_t pt;
+    printf("----------start tunnel_thread!\n");
+    int ret, len;
+    char buf[4096];
+    int c1 = accept(fd, NULL, NULL);
+    ASSERT_RET(c1 > 0, -1);
+    int c2 = accept(fd, NULL, NULL);
+    ASSERT_RET(c2 > 0, -1);
     struct epoll_event ev;
     struct epoll_event events[2];
-    uint32_t cmd;
 
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s listen_port proxy_port\n", argv[0]);
-        exit(1);
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        fprintf(stderr, "epoll create error.\n");
+        goto out;
+    }
+    ev.events = EPOLLIN;
+    ev.data.fd = c1;
+    if (0 != epoll_ctl(epoll_fd, EPOLL_CTL_ADD, c1, &ev))
+    {
+        fprintf(stderr, "epoll ctrol add error.\n");
+        goto out;
+    }
+    ev.events = EPOLLIN;
+    ev.data.fd = c2;
+    if (0 != epoll_ctl(epoll_fd, EPOLL_CTL_ADD, c2, &ev))
+    {
+        fprintf(stderr, "epoll ctrol add error.\n");
+        goto out;
     }
 
-    //daemon_init();
+    for(;;) {
+        ret = epoll_wait(epoll_fd, events, 1, -1);
+        if (ret != 1) {
+            fprintf(stderr, "epoll ctrol add error.\n");
+            goto out;
+        }
+        if (events[0].data.fd == c1) {
+            ret = read(c1, buf, sizeof(buf));
+            if (ret <= 0) {
+                break;
+            }
+            len = ret;
+            ret = write(c2, buf, len);
+            if (ret != len) {
+                break;
+            }
+        } else if (events[0].data.fd == c2) {
+            ret = read(c2, buf, sizeof(buf));
+            if (ret <= 0) {
+                break;
+            }
+            len = ret;
+            ret = write(c1, buf, len);
+            if (ret != len) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 
-    ASSERT_RET(0 < (s1 = create_listener(NULL, SERVER_LISTEN_PORT)), -1);
+out:
+    if (epoll_fd > 0) {
+        close(epoll_fd);
+    }
+    close(c1);
+    close(c2);
+    close(fd);
+    fprintf(stderr, "thread quit.\n");
+    return 0;
+}
+
+void *recv_cmd_thread(void *arg)
+{
+    pthread_detach(pthread_self());
+    int retval = 0;
+    int fd;
+
+    struct msg_tunnel cmd;
+
+    for (;;)
+    {
+        memset(&cmd, 0, sizeof(struct msg_tunnel));
+#if 0
+        retval = mq_receive(cmd_mq, (char *)&cmd, sizeof(struct msg_tunnel),
+                NULL);
+        if (retval != sizeof(struct msg_tunnel)) {
+            continue;
+        }
+#endif
+        cmd.UnitNo = 4096;
+        cmd.tunnelPort = 22;
+        cmd.cmd = CMD_TUNNEL_E;
+
+        struct client_node_t *find = NULL;
+        struct client_node_t *t = NULL;
+        struct hlist_node *temp = NULL;
+        hlist_for_each_entry_safe(t,temp,&client_ht[HASH(cmd.UnitNo)].head, node) {
+            if (t->UnitNo == cmd.UnitNo) {
+                find = t;
+                break;
+            }
+        }
+
+        if (NULL == find) {
+            sleep(1);
+            continue;
+        }
+
+        if (cmd.cmd != CMD_TUNNEL_E) {
+            continue;
+        }
+
+        fd = create_listener(NULL, "28100", 2);
+        if (fd < 0) {
+            printf("create listener failed!\n");
+            exit(-1);
+        }
+
+        struct sockaddr_in addr;
+        socklen_t slen;
+        TUNNEL_T tunnel_t;
+        if (0 != getsockname(fd, (struct sockaddr *)&addr, &slen)) {
+            printf("get sockname error[%m]\n");
+            return NULL;
+        }
+
+        printf("Create Tunnel Listen Port:%d\n", ntohs(addr.sin_port));
+
+        if (sizeof(cmd.cmd) != write(find->ctl_fd, &cmd.cmd, sizeof(cmd.cmd))) {
+            printf("write cmd error!\n");
+            return NULL;
+        }
+
+        tunnel_t.tunnel_port = cmd.tunnelPort;
+        tunnel_t.listen_port = addr.sin_port;
+        if (sizeof(TUNNEL_T) != write(find->ctl_fd, &tunnel_t, sizeof(TUNNEL_T))) {
+            printf("write cmd error!\n");
+            return NULL;
+        }
+
+        tunnel_thread(fd);
+        break;
+    }
+    return NULL;
+}
+
+int main(void) 
+{
+    int ret, s1, epoll_fd;
+    pthread_t pt;
+    struct epoll_event ev;
+    struct epoll_event events[20];
+    struct mq_attr attr;
+
+    attr.mq_maxmsg  = MAX_CMD_MSG_NUMS;
+    attr.mq_msgsize= sizeof(struct msg_tunnel);
+    mq_unlink(CMD_MQ_PATH);
+    cmd_mq = mq_open(CMD_MQ_PATH, O_RDWR|O_CREAT|O_EXCL, DEFAULT_MQ_MODE, &attr); 
+    ASSERT_RET(-1 != cmd_mq, -1);
+    
+    if (0 != pthread_create(&pt, NULL, recv_cmd_thread, NULL)) {
+        printf("pthread_create error!\n");
+        return -1;
+    }
+
+    ASSERT_RET(0 < (s1 = create_listener(NULL, SERVER_LISTEN_PORT,
+                    SERVER_MAX_LISTEN)), -1);
 
     epoll_fd = epoll_create1(0);
     ASSERT_RET(epoll_fd > 0, -1);
@@ -280,8 +432,9 @@ int main(int argc, const char **argv)
     ev.data.fd = s1;
     if (0 != epoll_ctl(epoll_fd, EPOLL_CTL_ADD, s1, &ev)) {
         fprintf(stderr, "epoll ctrol add error.\n");
-        goto out;
+        return -1;
     }
+
     for (;;) {
         ret = epoll_wait(epoll_fd, events, SERVER_MAX_LISTEN, -1);
         if (ret < 0) {
@@ -315,98 +468,40 @@ int main(int argc, const char **argv)
                     continue;
                 }
             } else if (events[i].events & EPOLLIN) {
-                ///< Client->Server HeartBeat: CMD_HEARTBEAT + UNITNO
-                int value = 0;
-                ret = read(events[i].data.fd, &value, sizeof(value));
-                if (ret != sizeof(value)) {
-                    printf("read error!\n");
-                    return -1;
+                int cmd = 0;
+                int nread = read(events[i].data.fd, &cmd, sizeof(cmd));
+                if (nread == 0)
+                {
+                    continue;
                 }
 
-                if (CMD_HEARTBEAT == value) {
-                    int UnitNo = 0;
-                    if (sizeof(UnitNo) != read(events[i].data.fd, &UnitNo,
-                                sizeof(UnitNo))) {
-                        printf("read error!\n");
-                        return -1;
-                    }
-                    struct sockaddr addr;
-                    socklen_t s_len;
-                    ASSERT_RET(0 == getpeername(events[i].data.fd, &addr, &s_len), -1);
-                    update_client_list(UnitNo, &addr);
-                }
-                else if (CMD_TUNNEL_RESP == value) {
+                switch (cmd) {
+                    case CMD_HEARTBEAT_E: 
+                        { 
+                            struct sockaddr addr;
+                            socklen_t slen;
+                            HEARTBEAT_T heartbeat_t; 
+                            if (sizeof(HEARTBEAT_T) != read(events[i].data.fd,
+                                        &heartbeat_t, sizeof(HEARTBEAT_T))) {
+                                printf("2read error[%m]!\n");
+                                continue;
+                            }
+                            ASSERT_RET(0 == getpeername(events[i].data.fd,
+                                        &addr, &slen), -1);
+                            update_client_list(heartbeat_t.unit_no, &addr,
+                                    events[i].data.fd); 
+                        } 
+                        break;
+                    case CMD_TUNNEL_RSP_E:
+                        break; 
+                    case CMD_TUNNEL_REQ_E:
+                        break;
+                    default:
+                        break;
                 }
             }
-            
         }
     }
-
-loop:
-    ret = epoll_wait(epoll_fd, events, 1, -1);
-    if (ret != 1) {
-        /* error */
-        exit(1);
-    }
-
-    if (events[0].data.fd == c) {
-        /* heartbreak */
-        ret = read(c, &cmd, sizeof(cmd));
-        if (ret != sizeof(cmd)) {
-            exit(1);
-        }
-        cmd = ntohl(cmd);
-        switch(cmd) {
-        case 0:
-            cmd = htonl(0);
-            ret = write(c, &cmd, sizeof(cmd));
-            if (ret != sizeof(cmd)) {
-                exit(1);
-            }
-            break;
-        default:
-            exit(1);
-            break;
-        }
-    } else if (events[0].data.fd != s2) {
-        exit(1);
-    }
-
-    /* new connections */
-    c2 = accept(s2, NULL, NULL);
-    if (c2 < 0) {
-        fprintf(stderr, "accept port[%s] error.\n", argv[2]);
-        exit(1);
-    }
-
-    cmd = htonl(1);
-    ret = write(c, &cmd, sizeof(cmd));
-    if (ret != sizeof(cmd)) {
-        exit(1);
-    }
-
-    c1 = accept(s1, NULL, NULL);
-    if (c1 < 0) {
-        fprintf(stderr, "accept port[%s] error.\n", argv[1]);
-        exit(1);
-    }
-
-
-    sp = (struct socket_pair *)malloc(sizeof(struct socket_pair));
-    if (sp == NULL) {
-        exit(1);
-    }
-    sp->s1 = c1;
-    sp->s2 = c2;
-
-    ret = pthread_create(&pt, NULL, data_forward, sp);
-    if (ret) {
-        exit(1);
-    }
-
-    goto loop;
-
-out:
     close(epoll_fd);
     return 0;
 }

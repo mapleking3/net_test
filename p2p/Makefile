@@ -1,6 +1,6 @@
 CC = gcc
 
-CFLAGS = -Wall -O2 -s
+CFLAGS = -Wall -O2 -s -g
 
 #CFLAGS += -DDEBUG
 
@@ -11,9 +11,11 @@ CFLAGS += -MD
 MISSING_DEPS = $(filter-out $(wildcard $(DEPS)),$(DEPS))
 MISSING_DEPS_SOURCES = $(wildcard $(patsubst %.d,%.c,$(MISSING_DEPS)))
 
+LDFLAGS	+= -lrt -lpthread
+
 LIBS=
 
-TARGET = jproxy jproxyd
+TARGET = jproxyd jproxy
 
 all : $(TARGET)
 
@@ -24,11 +26,11 @@ endif
 
 -include $(DEPS)
 
-jproxy:jproxy.o
-	$(CC) $(CFLAGS) $< -o $@ -lpthread
-
 jproxyd:jproxyd.o
-	$(CC) $(CFLAGS) $< -o $@ -lpthread
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+jproxy:jproxy.o
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 $(OBJS):%.o:%.c
 	$(CC) $(CFLAGS) -c $< -o $@
