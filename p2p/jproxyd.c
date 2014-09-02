@@ -391,7 +391,7 @@ void *recv_cmd_thread(void *arg)
         }
 
         tunnel_t.tunnel_port = cmd.tunnelPort;
-        tunnel_t.listen_port = addr.sin_port;
+        tunnel_t.listen_port = ntohs(addr.sin_port);
         if (sizeof(TUNNEL_T) != write(find->ctl_fd, &tunnel_t, sizeof(TUNNEL_T))) {
             printf("write cmd error!\n");
             return NULL;

@@ -14,7 +14,7 @@
 
 #include "interface.h"
 
-#define SERVER_ADDR "192.168.111.222"
+#define SERVER_ADDR "172.16.68.202"
 
 void *tunnel_thread(void *arg)
 {
@@ -36,7 +36,7 @@ void *tunnel_thread(void *arg)
 
     memset(&server, 0, sizeof(struct sockaddr_in));
     server.sin_family   = AF_INET;
-    server.sin_port     = tunnel_t.listen_port;
+    server.sin_port     = htons(tunnel_t.listen_port);
     server.sin_addr.s_addr = inet_addr(SERVER_ADDR);
 
     ASSERT_RET(0 == connect(s1, (struct sockaddr *)&server, sizeof(server)),
@@ -44,8 +44,8 @@ void *tunnel_thread(void *arg)
 
     memset(&localtunnel, 0, sizeof(struct sockaddr_in));
     localtunnel.sin_family  = AF_INET;
-    localtunnel.sin_port    = tunnel_t.tunnel_port;
-    localtunnel.sin_addr.s_addr = inet_addr("127.0.0.1");
+    localtunnel.sin_port    = htons(tunnel_t.tunnel_port);
+    localtunnel.sin_addr.s_addr = INADDR_ANY;
 
     ASSERT_RET(0 == connect(s2, (struct sockaddr *)&localtunnel,
                 sizeof(localtunnel)), NULL);
@@ -116,7 +116,7 @@ out:
     return NULL;
 }
 
-int main(int argc, const char **argv) 
+int main(void) 
 {
     int ret, s, epoll_fd;
     struct sockaddr_in server;
@@ -137,7 +137,7 @@ int main(int argc, const char **argv)
 
     ret = connect(s, (struct sockaddr *)&server, sizeof(server));
     if (ret) {
-        fprintf(stderr, "connet [%s][%s] error.\n", argv[1], argv[2]);
+        fprintf(stderr, "connet server error.\n");
         exit(1);
     }
     printf("connet successfully\n");
