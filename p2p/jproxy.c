@@ -14,7 +14,7 @@
 
 #include "interface.h"
 
-#define SERVER_ADDR "172.16.68.202"
+static const char SERVER_ADDR[40] = "172.16.68.202";
 
 void *tunnel_thread(void *arg)
 {
@@ -116,12 +116,17 @@ out:
     return NULL;
 }
 
-int main(void) 
+int main(int argc, char *argv[]) 
 {
     int ret, s, epoll_fd;
     struct sockaddr_in server;
     struct epoll_event ev;
     struct epoll_event events[1];
+
+    if (argc > 1)
+    {
+        snprintf(SERVER_ADDR, sizeof(SERVER_ADDR), "%s", argv[1]);
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
